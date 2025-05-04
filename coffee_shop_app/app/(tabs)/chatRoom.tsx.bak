@@ -1,0 +1,326 @@
+import { Alert, TouchableOpacity, View, Text, ToastAndroid, Platform } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { StatusBar } from 'expo-status-bar';
+import MessageList from '@/components/MessageList';
+import { MessageInterface } from '@/types/types';
+import { widthPercentageToDP as wp, heightPercentageToDP as hp } from 'react-native-responsive-screen';
+import { GestureHandlerRootView, TextInput } from 'react-native-gesture-handler';
+import { Feather } from '@expo/vector-icons';
+import { callChatBotAPI } from '@/services/chatBot';
+import PageHeader from '@/components/PageHeader';
+import { useCart } from '@/components/CartContext';
+import { getCachedMenuItems } from '@/services/productService';
+
+const ChatRoom = () => {
+    const { addToCart, emptyCart } = useCart();
+    const [currentOrder, setCurrentOrder] = useState<any[]>([]);
+    const [messages, setMessages] = useState<MessageInterface[]>([]);
+    const [isTyping, setIsTyping] = useState<boolean>(false);
+    const [menuItems, setMenuItems] = useState<Record<string, number>>({});
+    const textRef = useRef('');
+    const inputRef = useRef<TextInput>(null);
+
+    useEffect(() => {
+        const loadMenuItems = async () => {
+            try {
+                const items = await getCachedMenuItems();
+                setMenuItems(items);
+                console.log('✅ Menu items loaded:', Object.keys(items).length);
+            } catch (error) {
+                console.error('❌ Failed to load menu items:', error);
+            }
+        };
+        loadMenuItems();
+    }, []);
+
+    const showFeedback = (message: string) => {
+        if (Platform.OS === 'android') {
+            ToastAndroid.show(message, ToastAndroid.SHORT);
+        } else {
+            Alert.alert('Order Update', message);
+        }
+    };
+
+    const extractItemsFromText = (text: string): Array<{item: string, quantity: number, price: string}> => {
+        const items: Array<{item: string, quantity: number, price: string}> = [];
+        if (Object.keys(menuItems).length === 0) return items;
+
+        Object.keys(menuItems).forEach(itemName => {
+            const regex = new RegExp(`(\\d+)\\s+${itemName}|${itemName}`, 'i');
+            const match = text.match(regex);
+            if (match) {
+                const quantity = match[1] ? parseInt(match[1]) : 1;
+                items.push({
+                    item: itemName,
+                    quantity: quantity,
+                    price: `RM${menuItems[itemName].toFixed(2)}`
+                });
+            }
+        });
+
+        return items;
+    };
+
+    const ordersAreDifferent = (newOrder: any[], oldOrder: any[]): boolean => {
+        if (!newOrder || !oldOrder) return true;
+        if (newOrder.length !== oldOrder.length) return true;
+
+        // Create normalized maps of items to their quantities for both orders
+        const newOrderMap: Record<string, number> = {};
+        const oldOrderMap: Record<string, number> = {};
+        
+        // Normalize item names to lowercase for case-insensitive comparison
+        newOrder.forEach(item => {
+            const normalizedName = item.item.toLowerCase();
+            newOrderMap[normalizedName] = Number(item.quantity);
+        });
+        
+        oldOrder.forEach(item => {
+            const normalizedName = item.item.toLowerCase();
+            oldOrderMap[normalizedName] = Number(item.quantity);
+        });
+        
+        // Compare normalized maps
+        const allKeys = new Set([...Object.keys(newOrderMap), ...Object.keys(oldOrderMap)]);
+        for (const key of allKeys) {
+            if (newOrderMap[key] !== oldOrderMap[key]) {
+                console.log(`Order difference detected: ${key} - New: ${newOrderMap[key]}, Old: ${oldOrderMap[key]}`);
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    const extractItemsFromUserMessage = (message: string): { item: string, quantity: number }[] => {
+        const words = message.toLowerCase().split(/\s+/);
+        const extractedItems: { item: string, quantity: number }[] = [];
+        const processedItems = new Set<string>(); // Track which items we've already processed
+        
+        // Common typo variants that should map to menu items
+        const typoVariants: Record<string, string> = {
+            'savary': 'savory',
+            'savry': 'savory',
+            'savoury': 'savory',
+            'scavy': 'savory',
+            'jumbo': 'jumbo savory scone', // Only when standalone
+            'scone': 'jumbo savory scone'  // Only when standalone
+        };
+
+        // Try to match multi-word items first
+        for (let i = 0; i < words.length; i++) {
+            const quantity = parseInt(words[i]);
+            let itemNameStart = i + (isNaN(quantity) ? 0 : 1);
+
+            if (itemNameStart < words.length && ["a", "an", "the"].includes(words[itemNameStart])) {
+                itemNameStart += 1;
+            }
+
+            // Try longer phrases first (up to 4 words)
+            for (let phraseLength = 4; phraseLength >= 1; phraseLength--) {
+                if (itemNameStart + phraseLength <= words.length) {
+                    const originalPhrase = words.slice(itemNameStart, itemNameStart + phraseLength).join(" ");
+                    
+                    // Try with original phrase
+                    let matchedItem = findMatchingMenuItem(originalPhrase, menuItems);
+                    
+                    // If no match, try replacing known typos
+                    if (!matchedItem) {
+                        let modifiedPhrase = originalPhrase;
+                        Object.entries(typoVariants).forEach(([typo, correct]) => {
+                            modifiedPhrase = modifiedPhrase.replace(new RegExp(`\\b${typo}\\b`, 'g'), correct);
+                        });
+                        
+                        if (modifiedPhrase !== originalPhrase) {
+                            matchedItem = findMatchingMenuItem(modifiedPhrase, menuItems);
+                        }
+                    }
+
+                    if (matchedItem) {
+                        console.log(`🟢 Matched item from user message: "${originalPhrase}" -> "${matchedItem}"`);
+                        
+                        // Skip if we already processed this item
+                        if (!processedItems.has(matchedItem)) {
+                            extractedItems.push({
+                                item: matchedItem,
+                                quantity: isNaN(quantity) ? 1 : quantity
+                            });
+                            processedItems.add(matchedItem);
+                        }
+                        
+                        i = itemNameStart + phraseLength - 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return extractedItems;
+    };
+    
+    // Helper function to find a matching menu item
+    const findMatchingMenuItem = (phrase: string, menuItems: Record<string, number>): string | null => {
+        // Try exact match first
+        const exactMatch = Object.keys(menuItems).find(item => 
+            item.toLowerCase() === phrase.toLowerCase()
+        );
+        if (exactMatch) return exactMatch;
+        
+        // Special case for "jumbo savory scone" variations
+        if (phrase.includes('jumbo') && (phrase.includes('savory') || phrase.includes('savary') || 
+                                        phrase.includes('scavy') || phrase.includes('scone'))) {
+            const sconeMatch = Object.keys(menuItems).find(item => 
+                item.toLowerCase().includes('jumbo') && item.toLowerCase().includes('savory') && item.toLowerCase().includes('scone')
+            );
+            if (sconeMatch) return sconeMatch;
+        }
+        
+        // Try partial match (item contains the phrase or phrase contains the item)
+        const partialMatches = Object.keys(menuItems).filter(item => 
+            item.toLowerCase().includes(phrase) || phrase.includes(item.toLowerCase())
+        );
+        
+        if (partialMatches.length > 0) {
+            // Sort by length of match (prefer shortest for phrase.includes(item))
+            // and longest for item.includes(phrase)
+            partialMatches.sort((a, b) => {
+                const aLower = a.toLowerCase();
+                const bLower = b.toLowerCase();
+                
+                if (phrase.includes(aLower) && phrase.includes(bLower)) {
+                    return bLower.length - aLower.length; // Longer item name is better
+                }
+                if (aLower.includes(phrase) && bLower.includes(phrase)) {
+                    return aLower.length - bLower.length; // Shorter item name is better
+                }
+                return 0;
+            });
+            
+            return partialMatches[0];
+        }
+        
+        return null;
+    };
+
+    const handleSendMessage = async () => {
+        let message = textRef.current.trim();
+        if (!message) return;
+
+        try {
+            const extractedItems = extractItemsFromUserMessage(message);
+            if (extractedItems.length > 0) {
+                console.log("📝 Items extracted from user message:", extractedItems);
+            }
+
+            let InputMessages = [...messages, { content: message, role: 'user' }];
+            setMessages(InputMessages);
+            textRef.current = '';
+            inputRef?.current?.clear();
+            setIsTyping(true);
+
+            let responseMessage = await callChatBotAPI(InputMessages);
+            setIsTyping(false);
+            setMessages(prev => [...prev, responseMessage]);
+
+            console.groupCollapsed("🤖 ChatBot Log");
+            console.log("User Message:", message);
+            console.log("Bot Response:", responseMessage.content);
+            console.groupEnd();
+
+            if (responseMessage && responseMessage.memory) {
+                const orderItems = responseMessage.memory.order;
+
+                if (Array.isArray(orderItems) && orderItems.length > 0) {
+                    if (ordersAreDifferent(orderItems, currentOrder)) {
+                        const newItems = orderItems.filter(newItem =>
+                            !currentOrder.some(oldItem =>
+                                oldItem.item === newItem.item &&
+                                Number(oldItem.quantity) === Number(newItem.quantity)
+                            )
+                        );
+
+                        setCurrentOrder(orderItems);
+                        emptyCart();
+                        orderItems.forEach((item: any) => {
+                            if (item && item.item) {
+                                const quantity = Number(item.quantity || 1);
+                                addToCart(item.item, quantity);
+                            }
+                        });
+
+                        if (newItems.length > 0) {
+                            const itemText = newItems.map(i => `${i.quantity} ${i.item}`).join(", ");
+                            showFeedback(`Added to cart: ${itemText}`);
+                        }
+                    }
+                } else if (responseMessage.content.toLowerCase().includes("based on your order")) {
+                    const fallbackItems = extractItemsFromText(responseMessage.content);
+                    fallbackItems.forEach(item => {
+                        addToCart(item.item, item.quantity);
+                    });
+                    const itemText = fallbackItems.map(i => `${i.quantity} ${i.item}`).join(", ");
+                    showFeedback(`Added to cart: ${itemText}`);
+                }
+
+                if (responseMessage.content.includes("issue processing your order")) {
+                    if (extractedItems.length > 0) {
+                        extractedItems.forEach(item => {
+                            addToCart(item.item, item.quantity);
+                        });
+
+                        const feedback = extractedItems.map(i => `${i.quantity} ${i.item}`).join(", ");
+                        showFeedback(`Added to cart: ${feedback}`);
+
+                        const updatedResponse = {
+                            ...responseMessage,
+                            content: `I've added ${feedback} to your order. Would you like anything else?`
+                        };
+
+                        setMessages(prev => {
+                            const newMessages = [...prev];
+                            newMessages[newMessages.length - 1] = updatedResponse;
+                            return newMessages;
+                        });
+                    }
+                }
+            }
+        } catch (err: any) {
+            console.error("❌ Chat processing error:", err);
+            Alert.alert('Error', err.message);
+        }
+    };
+
+    return (
+        <GestureHandlerRootView>
+            <StatusBar style='dark' />
+            <View className='flex-1 bg-white'>
+                <PageHeader title="Chat Bot" showHeaderRight={false} bgColor='white' />
+                <View className='h-3 border-b border-neutral-300' />
+                <View className='flex-1 justify-between bg-neutral-100 overflow-visibile'>
+                    <View className='flex-1'>
+                        <MessageList messages={messages} isTyping={isTyping} />
+                    </View>
+                    <View style={{ marginBottom: hp(2.7) }} className='pt-2'>
+                        <View className="flex-row mx-3 justify-between border p-2 bg-white border-neutral-300 rounded-full pl-5">
+                            <TextInput
+                                ref={inputRef}
+                                onChangeText={value => textRef.current = value}
+                                placeholder='Type message...'
+                                style={{ fontSize: hp(2) }}
+                                className='flex-1 mr2'
+                            />
+                            <TouchableOpacity
+                                onPress={handleSendMessage}
+                                className='bg-neutral-200 p-2 mr-[1px] rounded-full'
+                            >
+                                <Feather name="send" size={hp(2.7)} color="#737373" />
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
+            </View>
+        </GestureHandlerRootView>
+    );
+};
+
+export default ChatRoom;

@@ -1,0 +1,284 @@
+import axios from 'axios';
+import { MessageInterface } from '@/types/types';
+import { API_KEY, API_URL } from '@/config/runpodConfigs';
+
+/**
+ * Function to detect and fix garbled text in bot responses
+ * @param text The text to validate
+ * @returns Cleaned text or null if text is too corrupted
+ */
+function validateResponseText(text: string): string | null {
+    if (!text) return null;
+    
+    // Detect merged digit-word patterns (like "2 LatteI2 Latte...")
+    if (text.length > 20) {
+        // Look for patterns where a number followed by text is immediately followed by another number
+        const mergedDigitWordPattern = /(\d+\s+[A-Za-z]+)([A-Za-z]?\d+)/;
+        if (mergedDigitWordPattern.test(text)) {
+            console.warn(`Detected merged digit-word pattern in response: ${text.substring(0, 100)}...`);
+            
+            // Extract the item and quantity from the start of the text
+            const firstItemMatch = text.match(/^(\d+)\s+([A-Za-z]+)/);
+            if (firstItemMatch) {
+                const [_, quantity, item] = firstItemMatch;
+                return `You have ordered ${quantity} ${item}. Would you like anything else?`;
+            }
+            return null;
+        }
+    }
+    
+    // Check for extreme repetition (a word repeating more than 5 times in sequence)
+    const words = text.split(/\s+/);
+    if (words.length > 10) {
+        let repetitionCount = 1;
+        let prevWord = words[0];
+        
+        for (let i = 1; i < words.length; i++) {
+            if (words[i] === prevWord) {
+                repetitionCount++;
+                if (repetitionCount > 5) {
+                    // Excessive repetition detected
+                    console.warn(`Excessive repetition detected in response: ${text.substring(0, 100)}...`);
+                    // Take just the first part before repetition started
+                    const cleanWords = words.slice(0, Math.max(i - repetitionCount + 1, 5));
+                    if (cleanWords.length < 3) return null;  // Too corrupted
+                    return cleanWords.join(' ') + '.';
+                }
+            } else {
+                repetitionCount = 1;
+                prevWord = words[i];
+            }
+        }
+    }
+    
+    // Check for character-level repetition (like "LaLaLaLaLa")
+    if (text.length > 20) {
+        const charPattern = /(.{2,5})\1{5,}/;
+        if (charPattern.test(text)) {
+            console.warn(`Character-level repetition detected in response: ${text.substring(0, 100)}...`);
+            return null;
+        }
+    }
+    
+    // Check for garbled text (high ratio of numbers mixed with text)
+    if (text.length > 20) {
+        const digitCount = (text.match(/\d/g) || []).length;
+        if (digitCount / text.length > 0.25) {  // More than 25% digits is suspicious
+            console.warn(`High digit ratio detected in response: ${text.substring(0, 100)}...`);
+            
+            // Try to extract meaningful information from the start
+            const meaningfulPart = text.match(/^([^0-9]+)/);
+            if (meaningfulPart && meaningfulPart[1].length > 20) {
+                return meaningfulPart[1].trim();
+            }
+            return null;
+        }
+    }
+    
+    // Check for sentences starting with numbers followed by abnormal patterns
+    if (/^\d+\s+\w+\d+/.test(text)) {
+        console.warn(`Detected repeated number prefixes in response: ${text.substring(0, 100)}...`);
+        
+        // Try to extract a meaningful part
+        const meaningfulMatch = text.match(/^(\d+\s+[A-Za-z]+)/);
+        if (meaningfulMatch) {
+            return `You have added ${meaningfulMatch[1]} to your order. Would you like anything else?`;
+        }
+        return null;
+    }
+    
+    return text;
+}
+
+/**
+ * Function to validate order quantities in bot responses
+ * @param message The message to validate
+ * @returns The validated message with consistent order quantities
+ */
+function validateOrderQuantities(message: MessageInterface): MessageInterface {
+    if (!message.memory?.order || !Array.isArray(message.memory.order)) {
+        return message;
+    }
+
+    // Check if the message content mentions specific quantities
+    const content = message.content || '';
+    
+    // First validate the content text for garbled responses
+    const validatedContent = validateResponseText(content);
+    if (validatedContent === null) {
+        // The content was too corrupted, replace with a generic message
+        // based on the order
+        const orderSummary = message.memory.order.map(item => 
+            `${item.quantity} ${item.item}`
+        ).join(', ');
+        
+        message.content = `You have ordered ${orderSummary}. Would you like anything else?`;
+    } else if (validatedContent !== content) {
+        // Content was cleaned up
+        message.content = validatedContent;
+    }
+    
+    // Extract order items from content
+    const updatedOrder = [...message.memory.order];
+    
+    // Check for specific phrases in the response that indicate single item additions
+    if (content.toLowerCase().includes('add a ') || content.toLowerCase().includes('add an ') || 
+        content.toLowerCase().includes('added a ') || content.toLowerCase().includes('added an ')) {
+        
+        // Get the most recently added item
+        const contentWords = content.toLowerCase().split(/\s+/);
+        
+        // Look for phrases like "added a jumbo savory scone" or "add a latte"
+        for (let i = 0; i < contentWords.length - 2; i++) {
+            if ((contentWords[i] === 'add' || contentWords[i] === 'added') && 
+                (contentWords[i + 1] === 'a' || contentWords[i + 1] === 'an')) {
+                
+                // Extract the item name that follows "add a" or "added a"
+                const itemFragment = contentWords.slice(i + 2).join(' ');
+                
+                // Find the matching item in the order
+                const matchingItemIndex = updatedOrder.findIndex(item => 
+                    itemFragment.includes(item.item.toLowerCase()) || 
+                    item.item.toLowerCase().includes(itemFragment)
+                );
+                
+                if (matchingItemIndex !== -1) {
+                    // Compare with previous messages to determine if this is a new addition
+                    const previousOrderIndex = matchingItemIndex > 0 ? matchingItemIndex - 1 : 0;
+                    
+                    // If quantity seems too high for a single addition, adjust it
+                    if (updatedOrder[matchingItemIndex].quantity > 1) {
+                        // Check if item was mentioned in content as single addition
+                        const explicitQuantity = content.match(new RegExp(`(\\d+)\\s+${updatedOrder[matchingItemIndex].item}`, 'i'));
+                        
+                        if (!explicitQuantity && content.toLowerCase().includes(`a ${updatedOrder[matchingItemIndex].item.toLowerCase()}`)) {
+                            // If message explicitly mentions "a [item]", set quantity to 1
+                            updatedOrder[matchingItemIndex].quantity = 1;
+                        }
+                    }
+                    
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Update the memory with corrected order
+    const validatedMessage = {
+        ...message,
+        memory: {
+            ...message.memory,
+            order: updatedOrder
+        }
+    };
+    
+    return validatedMessage;
+}
+
+async function callChatBotAPI(messages: MessageInterface[]): Promise<MessageInterface> {
+    try {
+        console.log("Sending messages to API:", JSON.stringify(messages, null, 2));
+        const response = await axios.post(API_URL, {
+            input: { messages }
+        }, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`
+            }
+        });
+        
+        console.log("Raw API response:", JSON.stringify(response.data, null, 2));
+        
+        // Handle different response structures
+        let outputMessage: MessageInterface;
+        
+        if (response.data && typeof response.data === 'object') {
+            if (response.data.output) {
+                // Standard structure: { output: { role, content, memory } }
+                outputMessage = response.data.output;
+                
+                // Check if response field exists and content is missing or empty
+                if (response.data.output.response && 
+                   (!response.data.output.content || response.data.output.content.trim() === '')) {
+                    // Validate the response text before using it
+                    const validatedResponse = validateResponseText(response.data.output.response);
+                    outputMessage.content = validatedResponse || 
+                        "I'm sorry, I couldn't process your response correctly. Could you please try again?";
+                }
+            } else if (response.data.role) {
+                // Direct message structure: { role, content, memory }
+                outputMessage = response.data;
+                
+                // Check if response field exists and content is missing or empty
+                if (response.data.response && 
+                   (!response.data.content || response.data.content.trim() === '')) {
+                    // Validate the response text before using it
+                    const validatedResponse = validateResponseText(response.data.response);
+                    outputMessage.content = validatedResponse || 
+                        "I'm sorry, I couldn't process your response correctly. Could you please try again?";
+                }
+            } else {
+                // Unknown structure, create a fallback message
+                outputMessage = {
+                    role: 'assistant',
+                    content: 'Sorry, I couldn\'t process your request properly.',
+                    memory: {}
+                };
+            }
+        } else {
+            // Completely unexpected response
+            outputMessage = {
+                role: 'assistant',
+                content: 'Sorry, I received an unexpected response format.',
+                memory: {}
+            };
+        }
+        
+        // Ensure content is never empty
+        if (!outputMessage.content || outputMessage.content.trim() === '') {
+            outputMessage.content = 'I apologize, but I don\'t have a specific response for that at the moment.';
+        }
+        
+        // Perform extra validation on the content to catch garbled text
+        const cleanContent = validateResponseText(outputMessage.content);
+        if (cleanContent === null) {
+            // Content was too corrupted, replace with a generic message
+            if (outputMessage.memory?.order) {
+                const orderItems = outputMessage.memory.order;
+                if (Array.isArray(orderItems) && orderItems.length > 0) {
+                    const orderSummary = orderItems.map(item => 
+                        `${item.quantity} ${item.item}`
+                    ).join(', ');
+                    
+                    outputMessage.content = `You have ordered ${orderSummary}. Would you like anything else?`;
+                } else {
+                    outputMessage.content = 'I apologize, but I couldn\'t process your request properly. Could you please try again?';
+                }
+            } else {
+                outputMessage.content = 'I apologize, but I couldn\'t process your request properly. Could you please try again?';
+            }
+        } else if (cleanContent !== outputMessage.content) {
+            // Content was cleaned up
+            outputMessage.content = cleanContent;
+        }
+        
+        // Validate and correct order quantities based on message content
+        const validatedMessage = validateOrderQuantities(outputMessage);
+        
+        console.log("Processed output message:", validatedMessage);
+        return validatedMessage;
+    } catch (error: any) {
+        console.error('Error calling the API:', error);
+        
+        // Return a friendly error message rather than throwing
+        const errorMessage: MessageInterface = {
+            role: 'assistant',
+            content: `I'm sorry, there was an error processing your request: ${error.message || 'Unknown error'}`,
+            memory: {}
+        };
+        
+        return errorMessage;
+    }
+}
+
+export { callChatBotAPI };

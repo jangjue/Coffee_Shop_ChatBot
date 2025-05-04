@@ -1,0 +1,21 @@
+Menu Items
+
+Cappuccino - RM14.50
+Jumbo Savory Scone - RM13.25
+Latte - RM14.75
+Chocolate Chip Biscotti - RM12.50
+Espresso shot - RM12.00
+Hazelnut Biscotti - RM12.75
+Chocolate Croissant - RM13.75
+Dark chocolate (Drinking Chocolate) - RM15.00
+Cranberry Scone - RM13.50
+Croissant - RM13.25
+Almond Croissant - RM14.00
+Ginger Biscotti - RM12.50
+Oatmeal Scone - RM13.25
+Ginger Scone - RM13.50
+Chocolate syrup - RM11.50
+Hazelnut syrup - RM11.50
+Carmel syrup - RM11.50
+Sugar Free Vanilla syrup - RM11.50
+Dark chocolate (Packaged Chocolate) - RM13.00

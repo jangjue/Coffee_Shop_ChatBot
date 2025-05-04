@@ -1,0 +1,466 @@
+import os
+import json
+import logging
+from .utils import get_chatbot_response, double_check_json_output
+from openai import OpenAI
+import re
+from copy import deepcopy
+from functools import lru_cache
+from dotenv import load_dotenv
+load_dotenv()
+
+# Configure logging for detailed debugging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("order_taking_agent")
+
+class OrderTakingAgent():
+    def __init__(self, recommendation_agent):
+        # Initialize OpenAI client once and reuse
+        self.client = OpenAI(
+            api_key=os.getenv("RUNPOD_TOKEN"),
+            base_url=os.getenv("RUNPOD_CHATBOT_URL"),
+        )
+        self.model_name = os.getenv("MODEL_NAME")
+
+        self.recommendation_agent = recommendation_agent
+        
+        # Define the valid menu items for error correction
+        self.menu_items = {
+            "cappuccino": "Cappuccino",
+            "jumbo savory scone": "Jumbo Savory Scone",
+            "jumbo": "Jumbo Savory Scone",
+            "savory scone": "Jumbo Savory Scone",
+            "scone": "Jumbo Savory Scone",
+            "latte": "Latte",
+            "chocolate chip biscotti": "Chocolate Chip Biscotti",
+            "espresso shot": "Espresso shot",
+            "espresso": "Espresso shot",
+            "hazelnut biscotti": "Hazelnut Biscotti",
+            "chocolate croissant": "Chocolate Croissant",
+            "dark chocolate": "Dark chocolate",
+            "cranberry scone": "Cranberry Scone",
+            "croissant": "Croissant",
+            "almond croissant": "Almond Croissant",
+            "ginger biscotti": "Ginger Biscotti",
+            "oatmeal scone": "Oatmeal Scone",
+            "ginger scone": "Ginger Scone",
+            "chocolate syrup": "Chocolate syrup",
+            "hazelnut syrup": "Hazelnut syrup",
+            "carmel syrup": "Carmel syrup",
+            "sugar free vanilla syrup": "Sugar Free Vanilla syrup",
+            "vanilla": "Sugar Free Vanilla syrup"
+        }
+        
+        # Removed fuzzy_matches dictionary
+        # Price lookup table
+        self.price_lookup = {
+            "Cappuccino": 14.50,
+            "Jumbo Savory Scone": 13.25,
+            "Latte": 14.75,
+            "Chocolate Chip Biscotti": 12.50,
+            "Espresso shot": 12.00,
+            "Hazelnut Biscotti": 12.75,
+            "Chocolate Croissant": 13.75,
+            "Dark chocolate": 15.00,
+            "Cranberry Scone": 13.50,
+            "Croissant": 13.25,
+            "Almond Croissant": 14.00,
+            "Ginger Biscotti": 12.50,
+            "Oatmeal Scone": 13.25,
+            "Ginger Scone": 13.50,
+            "Chocolate syrup": 11.50,
+            "Hazelnut syrup": 11.50,
+            "Carmel syrup": 11.50,
+            "Sugar Free Vanilla syrup": 11.50
+        }
+        
+        # Pre-compile regex patterns for better performance
+        self._quantity_pattern_cache = {}
+        
+        # Pre-process menu items for faster lookup
+        self._all_matches = {**self.menu_items} # Use only menu_items
+        self._sorted_matches = sorted(self._all_matches.keys(), key=len, reverse=True)
+        
+        # System prompt caching
+        self._system_prompt = None
+
+    # Cache quantity extraction patterns for common items
+    def _get_quantity_pattern(self, item_key):
+        if item_key not in self._quantity_pattern_cache:
+            self._quantity_pattern_cache[item_key] = re.compile(r'(\d+)\s+(?:' + re.escape(item_key) + ')')
+        return self._quantity_pattern_cache[item_key]
+
+    def extract_potential_items(self, message_text):
+        message_text = message_text.lower()
+        potential_items = []
+        matched_items = {}
+        
+        # First, look for explicit quantity patterns (like "2 lattes")
+        # This has higher priority than inferring from "add a/an" patterns
+        explicit_quantity_pattern = re.compile(r'(\d+)\s+([a-z\s]+)')
+        explicit_matches = explicit_quantity_pattern.findall(message_text)
+        
+        processed_text = message_text
+        
+        # Process explicit quantity patterns first
+        for quantity_str, item_fragment in explicit_matches:
+            item_fragment = item_fragment.strip()
+            quantity = int(quantity_str)
+            
+            # Find the matching menu item
+            found_match = False
+            for key in self._sorted_matches:
+                if key in item_fragment or item_fragment in key:
+                    item_name = self._all_matches[key]
+                    if item_name in matched_items:
+                        matched_items[item_name] += quantity
+                    else:
+                        matched_items[item_name] = quantity
+                        
+                    # Mark this part as processed
+                    match_text = f"{quantity_str} {item_fragment}"
+                    processed_text = processed_text.replace(match_text, " " * len(match_text))
+                    found_match = True
+                    logger.info(f"Matched explicit quantity: {quantity} {item_name}")
+                    break
+                    
+        # Next, handle "add a/an" patterns which indicate singular items
+        # These patterns take precedence over simple word matches
+        add_singular_pattern = re.compile(r'add\s+(?:a|an)\s+([a-z\s]+)')
+        singular_matches = add_singular_pattern.findall(processed_text)
+        
+        # Process singular additions
+        for match in singular_matches:
+            match = match.strip()
+            found_match = False
+            
+            # Try to match the longest menu items first to avoid partial matches
+            for key in self._sorted_matches:
+                if key in match:
+                    item_name = self._all_matches[key]
+                    # For "add a/an" pattern, always set quantity to 1
+                    if item_name in matched_items:
+                        # If already matched from explicit quantity, don't override
+                        pass
+                    else:
+                        matched_items[item_name] = 1
+                    
+                    # Mark this part as processed
+                    match_text = f"add a {match}" if "add a " in processed_text else f"add an {match}"
+                    processed_text = processed_text.replace(match_text, " " * len(match_text))
+                    found_match = True
+                    logger.info(f"Matched 'add a/an' pattern: 1 {item_name}")
+                    break
+            
+            # Removed fuzzy matching block
+        # Finally, look for any remaining menu items in the text
+        # But only if they weren't already matched by the patterns above
+        for key in self._sorted_matches:
+            if key in processed_text:
+                item_name = self._all_matches[key]
+                if item_name not in matched_items:
+                    matched_items[item_name] = 1
+                    logger.info(f"Matched remaining item: 1 {item_name}")
+        
+        # Create the final items list with consistent price formatting
+        for item_name, quantity in matched_items.items():
+            price_per_unit = self.price_lookup.get(item_name, 10.00)
+            price = price_per_unit * quantity
+            potential_items.append({
+                "item": item_name,
+                "quantity": quantity,
+                "price": f"RM{price:.2f}"
+            })
+
+        logger.info(f"Final extracted potential items: {json.dumps(potential_items)}")
+        return potential_items
+
+    def _extract_quantity(self, text, item_key):
+        # Use cached compiled regex pattern
+        pattern = self._get_quantity_pattern(item_key)
+        match = pattern.search(text)
+        return int(match.group(1)) if match else 1
+
+    def update_order(self, current_order, new_items):
+        """Update the order with new items, merging similar items and avoiding duplicates"""
+        if not current_order:
+            current_order = []
+            
+        # First normalize all item names in current_order and new_items
+        # This helps with comparing and avoiding duplicates
+        for item in current_order:
+            if "item" in item:
+                # If the item is a variation of "Jumbo Savory Scone", normalize it
+                item_lower = item["item"].lower()
+                if any(word in item_lower for word in ["jumbo", "savory", "savary", "scone", "scavy"]):
+                    if "jumbo" in item_lower and ("savory" in item_lower or "savary" in item_lower or "scavy" in item_lower):
+                        item["item"] = "Jumbo Savory Scone"
+                        
+        # Similarly normalize new items
+        normalized_new_items = []
+        for item in new_items:
+            if "item" in item:
+                item_copy = item.copy()  # Create a copy to avoid modifying the original
+                item_lower = item_copy["item"].lower()
+                if any(word in item_lower for word in ["jumbo", "savory", "savary", "scone", "scavy"]):
+                    if "jumbo" in item_lower or "savory" in item_lower or "savary" in item_lower or "scavy" in item_lower:
+                        item_copy["item"] = "Jumbo Savory Scone"
+                normalized_new_items.append(item_copy)
+            else:
+                normalized_new_items.append(item)
+                
+        # Now process the normalized new items
+        for new_item in normalized_new_items:
+            # Normalize item name for comparison
+            normalized_name = new_item["item"].lower()
+            
+            # Check if item already exists in order
+            found = False
+            for existing in current_order:
+                if existing["item"].lower() == normalized_name:
+                    # Update quantity
+                    existing["quantity"] = existing.get("quantity", 1) + new_item.get("quantity", 1)
+                    # Update price based on new quantity
+                    price_per_unit = self.price_lookup.get(existing["item"], 10.00)
+                    existing["price"] = price_per_unit * existing["quantity"]
+                    found = True
+                    break
+            
+            # If item not found, add it to the order
+            if not found:
+                current_order.append(new_item)
+        
+        logger.info(f"Updated order after merging items: {current_order}")
+        return current_order
+
+    # Cache the system prompt for better performance
+    @property
+    def system_prompt(self):
+        if self._system_prompt is None:
+            self._system_prompt = """
+            You are a customer support Bot for a coffee shop called "Old Kasturi"
+
+            Here is the menu for this coffee shop:
+
+            Cappuccino - RM14.50
+            Jumbo Savory Scone - RM13.25
+            Latte - RM14.75
+            Chocolate Chip Biscotti - RM12.50
+            Espresso shot - RM12.00
+            Hazelnut Biscotti - RM12.75
+            Chocolate Croissant - RM13.75
+            Dark chocolate (Drinking Chocolate) - RM15.00
+            Cranberry Scone - RM13.50
+            Croissant - RM13.25
+            Almond Croissant - RM14.00
+            Ginger Biscotti - RM12.50
+            Oatmeal Scone - RM13.25
+            Ginger Scone - RM13.50
+            Chocolate syrup - RM11.50
+            Hazelnut syrup - RM11.50
+            Carmel syrup - RM11.50
+            Sugar Free Vanilla syrup - RM11.50
+            Dark chocolate (Packaged Chocolate) - RM13.00
+
+            Things to NOT DO:
+            * DON'T ask how to pay by cash or Card.
+            * Don't tell the user to go to the counter
+            * Don't tell the user to go to place to get the order
+
+            IMPORTANT ABOUT ORDER HANDLING:
+            - ALWAYS maintain the complete order history. If the user says "add X", add it to the existing order.
+            - If the user mentions a quantity, like "2 lattes", create an entry with that quantity.
+            - If a user adds more of an item already in the order, UPDATE its quantity rather than creating a duplicate entry.
+            - Never delete items from the order unless the user explicitly asks to remove something.
+            - If the order list is empty but the user asks to add items, create a new order list with those items.
+            - Pay close attention to quantities mentioned by the user.
+            - Look for keywords like "add" or "more" which indicate adding to the existing order rather than a new order.
+            - If a user enters a typo or misspelling, try to match it to the closest menu item.
+            - If the user says something like "add a scavy scone", understand they mean "add a savory scone".
+            - NEVER reset the order list completely unless explicitly told to do so.
+            - The order state will be passed to you in the message, always maintain it.
+
+            You're task is as follows:
+            1. Take the User's Order
+            2. Validate that all their items are in the menu
+            3. if an item is not in the menu let the user and repeat back the remaining valid order
+            4. Ask them if they need anything else.
+            5. If they do then repeat starting from step 3
+            6. If they don't want anything else. Using the "order" object that is in the output. Make sure to hit all three points
+                1. list down all the items and their prices
+                2. calculate the total. 
+                3. Thank the user for the order and close the conversation with no more questions
+
+            The user message will contain a section called memory. This section will contain the following:
+            "order"
+            "step number"
+            please utilize this information to determine the next step in the process.
+            
+            produce the following output without any additions, not a single letter outside of the structure bellow.
+            Your output should be in a structured json format like so. each key is a string and each value is a string. Make sure to follow the format exactly:
+            {
+            "chain of thought": "Write down your critical thinking about what is the maximum task number the user is on right now. Then write down your critical thinking about the user input and it's relation to the coffee shop process. Then write down your thinking about how you should respond in the response parameter taking into consideration the Things to NOT DO section. and Focus on the things that you should not do.",
+            "step number": "Determine which task you are on based on the conversation.",
+            "order": "this is going to be a list of jsons like so. [{"item":put the item name, "quantity": put the number that the user wants from this item, "price":put the total price of the item }]",
+            "response": "write the a response to the user"
+            }
+        """
+        return self._system_prompt
+
+    def get_response(self, messages):
+        messages = deepcopy(messages)
+        logger.info("Processing new request with %d messages", len(messages))
+
+        step_number = "1"
+        asked_recommendation_before = False
+        current_order = []
+
+        # Optimize message parsing - only look at the last few messages
+        max_message_history = 10  # Only check the last 10 messages for better performance
+        
+        for message_index in range(len(messages)-1, max(0, len(messages)-max_message_history-1), -1):
+            message = messages[message_index]
+            if message["role"] == "assistant" and message.get("memory", {}).get("agent") == "order_taking_agent":
+                step_number = message["memory"].get("step number", "1")
+                order = message["memory"].get("order", [])
+                asked_recommendation_before = message["memory"].get("asked_recommendation_before", False)
+                if order:
+                    current_order = order
+                    logger.info(f"Found existing order: {json.dumps(current_order)}")
+                    break
+
+        user_message = messages[-1]['content'].lower()
+        try:
+            potential_items = self.extract_potential_items(user_message)
+            if potential_items:
+                current_order = self.update_order(current_order, potential_items)
+                # Log the actual order after extraction
+                logger.info(f"Updated order after extraction: {json.dumps(current_order)}")
+        except Exception as e:
+            logger.error(f"Error extracting items: {str(e)}")
+
+        last_order_taking_status = f"""
+        step number: {step_number}
+        order: {json.dumps(current_order)}
+        """
+        enriched_message = last_order_taking_status + " \n " + messages[-1]['content']
+        messages[-1]['content'] = enriched_message
+
+        # Use only the most recent messages for context to reduce API payload size
+        input_messages = [{"role": "system", "content": self.system_prompt}] + messages[-min(10, len(messages)):]
+
+        logger.info(f"Sending messages to LLM: {json.dumps(input_messages)}") # Log input to LLM
+        chatbot_output = get_chatbot_response(self.client, self.model_name, input_messages, temperature=0.1)
+        logger.info(f"Raw LLM output received: {chatbot_output}") # Log raw output
+        chatbot_output = double_check_json_output(self.client, self.model_name, chatbot_output)
+        logger.info(f"Output after double_check_json_output: {chatbot_output}") # Log after check
+
+        return self.postprocess(chatbot_output, messages, asked_recommendation_before, current_order)
+
+    def postprocess(self, output, messages, asked_recommendation_before, current_order=[]):
+        logger.info(f"Entering postprocess with raw output: {output}") # Log input to postprocess
+        try:
+            output = json.loads(output)
+        except json.JSONDecodeError:
+            output = {
+                "step number": "1",
+                "order": "[]",
+                "response": "I'm sorry, there was an issue processing your order. Could you please let me know what you'd like to order?"
+            }
+            logger.warning(f"JSONDecodeError in postprocess. Using default output: {output}") # Log JSON error
+        
+        # Use the current_order passed in, as it's already updated in get_response
+        final_order = deepcopy(current_order) if current_order else []
+
+        # Identify recommendations in the response
+        response_text = output.get("response", "")
+        # (Keep remaining postprocessing logic from line 444 onwards)
+        contains_recommendations = any(phrase in response_text.lower() for phrase in 
+                                      ["recommend", "suggestion", "popular", "might like", "try", "goes well"])
+        
+        # Log relevant information for debugging
+        if os.getenv("DEBUG_ORDER_PROCESSING") == "true":
+            # logger.info(f"User message: {user_message}") # Removed as user_message is no longer defined here
+            # logger.info(f"Extracted items: {json.dumps(extracted_items)}") # Removed as extracted_items is no longer defined here
+            logger.info(f"Current order (passed to postprocess): {json.dumps(current_order)}")
+            # logger.info(f"LLM order: {json.dumps(llm_order) if llm_order is not None else None}") # Removed as llm_order is no longer defined here
+            logger.info(f"Final order (after postprocess adjustments): {json.dumps(final_order)}")
+            logger.info(f"Response contains recommendations: {contains_recommendations}")
+        
+        # Validate the items in the order to ensure consistent pricing
+        for item in final_order:
+            item_name = item.get("item")
+            if item_name in self.price_lookup:
+                quantity = int(item.get("quantity", 1))  # Ensure quantity is an integer
+                price_per_unit = self.price_lookup[item_name]
+                # Update price to ensure consistency with quantity
+                item["price"] = f"RM{price_per_unit:.2f}"
+                item["quantity"] = quantity
+        
+        # Update the output with the final order
+        output["order"] = final_order
+        
+        if "step number" not in output:
+            output["step number"] = "1"
+        if "response" not in output:
+            # Construct a response based on the final order if LLM failed to provide one
+            if final_order:
+                order_summary = ", ".join([f"{item.get('quantity')} {item.get('item')}" for item in final_order])
+                output["response"] = f"Okay, I've updated your order. It now contains: {order_summary}. Would you like to add anything else?"
+                logger.warning("LLM did not provide a response key. Constructed fallback response based on final_order.")
+            else:
+                output["response"] = "I'm sorry, there was an issue processing your request. Could you please tell me what you'd like to order?"
+                logger.warning("LLM did not provide a response key and final_order is empty. Using generic fallback.")
+        # Fix response to be consistent with the order quantities
+        response_text = output["response"]
+
+        # If the response mentions items that aren't in the order, clarify this is a recommendation
+        pattern = re.compile(r'\b(Cappuccino|Latte|Biscotti|Croissant|Scone|Espresso|Chocolate|Hazelnut|Ginger|Oatmeal|Vanilla|Carmel)\b')
+        mentioned_items = pattern.findall(response_text)
+        
+        for item_name in mentioned_items:
+            # Check if this item is in the final order
+            in_order = any(item.get("item", "").lower() == item_name.lower() for item in final_order)
+            if not in_order and not contains_recommendations:
+                # Item is mentioned but not in order, make it clear this is a recommendation
+                pattern = re.compile(r'\b' + re.escape(item_name) + r'\b')
+                replacement = f"{item_name} (as a recommendation)"
+                response_text = pattern.sub(replacement, response_text)
+        
+        # Fix the order display in the response text to match the actual order
+        order_summary_pattern = re.compile(r'order(?:\s+is(?:\s+now)?)?(?:\s*:|\s+contains)?\s*(.*?)(?:\.|\n|would)', re.IGNORECASE)
+        order_match = order_summary_pattern.search(response_text)
+        
+        if order_match and final_order:
+            # Generate the correct order summary
+            correct_summary = ", ".join([f"{item.get('quantity')} {item.get('item')}" for item in final_order])
+            
+            # Replace the incorrect summary with the correct one
+            old_summary = order_match.group(1).strip()
+            response_text = response_text.replace(old_summary, correct_summary)
+        
+        # Calculate total for verification
+        total = sum(float(item.get("price", "0").replace("RM", "")) * int(item.get("quantity", 1))
+                    for item in final_order)
+        
+        # Check if response mentions a total and verify it's correct
+        if "total" in response_text.lower():
+            total_match = re.search(r'RM\s*(\d+\.\d+)', response_text)
+            if total_match:
+                response_total = float(total_match.group(1))
+                # If total in response differs significantly from calculated total, fix it
+                if abs(response_total - total) > 0.01:
+                    response_text = response_text.replace(f"RM{response_total:.2f}", f"RM{total:.2f}")
+        
+        # Update the response
+        output["response"] = response_text
+        
+        # Ensure the memory contains the correct information
+        output["memory"] = {
+            "agent": "order_taking_agent",
+            "step number": output["step number"],
+            "order": final_order,
+            "asked_recommendation_before": asked_recommendation_before
+        }
+        output["role"] = "assistant"
+        return output
